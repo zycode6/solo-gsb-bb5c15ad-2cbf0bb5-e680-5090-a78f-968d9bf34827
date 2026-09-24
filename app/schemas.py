@@ -56,6 +56,50 @@ class CompileResponse(BaseModel):
     )
 
 
+class ChangeItem(BaseModel):
+    """对单条现有口令的改动。
+
+    只允许改 ``offset_ms`` / ``duration_ms``，且两者至少给出一个新值；
+    其余字段（``channel``、``anchor`` 等）不可通过改动覆盖。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., description="要改动的现有口令 id")
+    offset_ms: int | None = Field(
+        default=None,
+        description="新的偏移（毫秒），允许为负；与 duration_ms 至少提供一个",
+    )
+    duration_ms: int | None = Field(
+        default=None,
+        description="新的持续时长（毫秒），必须为正数；与 offset_ms 至少提供一个",
+    )
+
+
+class PreviewRequest(BaseModel):
+    """``POST /preview`` 请求体：/compile 同款口令数组 + 一项单点改动。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[CommandItem] = Field(..., description="与 /compile 相同的口令数组")
+    change: ChangeItem = Field(..., description="对某条现有口令的单点改动")
+
+
+class PreviewResponse(BaseModel):
+    changed_ids: list[str] = Field(
+        ...,
+        description="时间起止发生变化的口令 id（含锚点依赖传导），按 id 排序",
+    )
+    added_conflicts: list[ConflictPair] = Field(
+        ...,
+        description="改动后新增的同通道冲突对（区间取自改动后版本），按 (a, b, channel) 排序",
+    )
+    removed_conflicts: list[ConflictPair] = Field(
+        ...,
+        description="改动后消失的同通道冲突对（区间取自改动前版本），按 (a, b, channel) 排序",
+    )
+
+
 class ErrorBody(BaseModel):
     code: Literal[
         "INVALID_REQUEST",
@@ -66,6 +110,8 @@ class ErrorBody(BaseModel):
         "MISSING_ANCHOR",
         "DEPENDENCY_CYCLE",
         "NEGATIVE_START",
+        "INVALID_CHANGE",
+        "UNKNOWN_CHANGE_ID",
     ]
     message: str
     details: dict | None = None

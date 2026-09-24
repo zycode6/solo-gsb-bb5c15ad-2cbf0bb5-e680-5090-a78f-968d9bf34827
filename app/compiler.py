@@ -9,6 +9,8 @@
   不得小于 0。
 * 起点解析后按 ``(start_ms, id)`` 排序输出；同通道的半开区间
   ``[start_ms, end_ms)`` 相互重叠时产生冲突对，首尾相接不算冲突。
+* :func:`preview_change` 分别编译原编排与单点改动后的编排，输出时间起止
+  发生变化的口令 id（含锚点依赖传导）以及新增 / 消失的同通道冲突对。
 """
 
 from __future__ import annotations
@@ -155,6 +157,80 @@ def compile_commands(items: list[dict[str, Any]]) -> dict[str, Any]:
     conflicts = _find_conflicts(ordered_ids, by_id, starts, ends)
 
     return {"timeline": timeline, "conflicts": conflicts}
+
+
+def preview_change(
+    items: list[dict[str, Any]], change: dict[str, Any]
+) -> dict[str, Any]:
+    """对比原编排与应用单点改动后的编排，输出时间变化与冲突对差异。
+
+    ``change`` 需指定现有口令 ``id``，并至少给出 ``offset_ms`` /
+    ``duration_ms`` 中的一个新值；改动只作用于这两个字段，目标口令的其余
+    字段保持原值，传入的 ``items`` 本身不会被修改。
+
+    :raises CompileError: 原编排或改动后编排的校验错误沿用
+        :func:`compile_commands` 的错误码；改动未给出任何新值
+        （``INVALID_CHANGE``）或目标 id 不存在（``UNKNOWN_CHANGE_ID``）
+        时由本函数抛出。
+    """
+    target = change.get("id")
+    new_offset = change.get("offset_ms")
+    new_duration = change.get("duration_ms")
+    if target is None or (new_offset is None and new_duration is None):
+        raise CompileError(
+            "INVALID_CHANGE",
+            "改动需指定口令 id，并至少提供 offset_ms 或 duration_ms 中的一个新值",
+            {
+                "id": target,
+                "offset_ms": new_offset,
+                "duration_ms": new_duration,
+            },
+        )
+
+    # 原编排先行编译：基数组自身的错误优先于改动相关错误暴露；
+    # 逐条浅拷贝，避免 compile_commands 的缺省值回填污染调用方数据
+    original = compile_commands([dict(item) for item in items])
+
+    if target not in {entry["id"] for entry in original["timeline"]}:
+        raise CompileError(
+            "UNKNOWN_CHANGE_ID",
+            f"改动目标口令不存在: {target}",
+            {"id": target},
+        )
+
+    modified_items = [dict(item) for item in items]
+    for item in modified_items:
+        if item["id"] == target:
+            if new_offset is not None:
+                item["offset_ms"] = new_offset
+            if new_duration is not None:
+                item["duration_ms"] = new_duration
+            break
+    modified = compile_commands(modified_items)
+
+    # 时间起止发生变化的口令（锚点依赖传导自然体现在解析结果中），按 id 排序
+    before = {e["id"]: (e["start_ms"], e["end_ms"]) for e in original["timeline"]}
+    after = {e["id"]: (e["start_ms"], e["end_ms"]) for e in modified["timeline"]}
+    changed_ids = sorted(cid for cid in before if before[cid] != after[cid])
+
+    # 冲突对以 (channel, a, b) 判定身份：新增对携带改动后版本区间，
+    # 消失对携带改动前版本区间；仅区间平移的对不计入差异
+    before_pairs = {(c["channel"], c["a"], c["b"]): c for c in original["conflicts"]}
+    after_pairs = {(c["channel"], c["a"], c["b"]): c for c in modified["conflicts"]}
+
+    def pair_order(conflict: dict[str, Any]) -> tuple[str, str, str]:
+        return (conflict["a"], conflict["b"], conflict["channel"])
+
+    added = [after_pairs[key] for key in after_pairs if key not in before_pairs]
+    removed = [before_pairs[key] for key in before_pairs if key not in after_pairs]
+    added.sort(key=pair_order)
+    removed.sort(key=pair_order)
+
+    return {
+        "changed_ids": changed_ids,
+        "added_conflicts": added,
+        "removed_conflicts": removed,
+    }
 
 
 def _resolve_times(

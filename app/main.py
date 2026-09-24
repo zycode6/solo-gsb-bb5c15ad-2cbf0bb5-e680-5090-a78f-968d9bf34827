@@ -7,15 +7,22 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from .compiler import CompileError, compile_commands
-from .schemas import CommandItem, CompileResponse, ErrorBody
+from .compiler import CompileError, compile_commands, preview_change
+from .schemas import (
+    CommandItem,
+    CompileResponse,
+    ErrorBody,
+    PreviewRequest,
+    PreviewResponse,
+)
 
 app = FastAPI(
     title="直播导播口令编排 API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "接收导播口令数组，解析锚点依赖得到每条口令的起止毫秒时间，"
-        "并列出同通道半开区间重叠的冲突 id 对。"
+        "并列出同通道半开区间重叠的冲突 id 对；/preview 可预演单点改动"
+        "对时间线与冲突的影响。"
     ),
 )
 
@@ -57,3 +64,18 @@ async def health() -> dict[str, str]:
 async def compile(items: list[CommandItem]) -> dict:
     # 核心逻辑不依赖 Pydantic，直接喂入 dict 以便独立测试与复用
     return compile_commands([item.model_dump() for item in items])
+
+
+@app.post(
+    "/preview",
+    response_model=PreviewResponse,
+    tags=["compile"],
+    summary="预演改动：分别编译原编排与改动后编排并输出差异",
+    responses={422: {"model": ErrorBody, "description": "请求非法或编排失败"}},
+)
+async def preview(request: PreviewRequest) -> dict:
+    # 与 /compile 一致：转成普通 dict 交给不依赖框架的核心逻辑
+    return preview_change(
+        [item.model_dump() for item in request.items],
+        request.change.model_dump(),
+    )

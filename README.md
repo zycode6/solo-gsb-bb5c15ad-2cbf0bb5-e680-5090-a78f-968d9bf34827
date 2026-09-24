@@ -6,6 +6,7 @@
 - 在线接口文档（Swagger UI）：<http://localhost:8000/docs>
 - 健康检查：`GET /health`
 - 编排接口：`POST /compile`
+- 改动预演接口：`POST /preview`
 
 ## 一条命令启动
 
@@ -143,6 +144,80 @@ curl -s http://localhost:8000/compile \
 }
 ```
 
+## 接口约定：`POST /preview`
+
+预演一项单点改动：分别编译**原编排**与**改动后编排**，输出两者差异。
+`items` 为与 `POST /compile` 完全相同的口令数组（校验规则、错误码一致），
+`change` 描述对某条现有口令的改动：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `items` | array | 是 | 口令数组，格式与 `POST /compile` 请求体相同 |
+| `change` | object | 是 | 单点改动，见下方三个字段 |
+| `change.id` | string | 是 | 要改动的现有口令 `id`；不存在时返回 `UNKNOWN_CHANGE_ID` |
+| `change.offset_ms` | integer | 否 | 新的偏移（毫秒），允许为负；与 `duration_ms` **至少提供一个** |
+| `change.duration_ms` | integer | 否 | 新的持续时长（毫秒），必须为正数；与 `offset_ms` **至少提供一个** |
+
+差异规则：
+
+- 改动只作用于目标口令的 `offset_ms` / `duration_ms`，**其余字段保持原值**，
+  且请求中的 `items` 不会被修改；`change` 不允许携带其他字段。
+- 原编排与改动后编排各自完整执行 `/compile` 的全部校验，任一失败即返回
+  对应的 `422` 错误（如改动后时长非正返回 `INVALID_DURATION`）。
+- `changed_ids`：时间起止（`start_ms` / `end_ms`）发生变化的口令 id，
+  **含锚点依赖传导**（被改动口令的下游依赖一并计入），按 id 排序。
+- 冲突对以 `(channel, a, b)` 判定身份：改动后出现的计入 `added_conflicts`
+  （区间取自改动后版本），改动后消失的计入 `removed_conflicts`
+  （区间取自改动前版本）；两个版本都存在的对（即使区间平移）不计入差异。
+  两个列表各自按 `(a, b, channel)` 排序。
+
+### 请求示例
+
+```bash
+curl -s http://localhost:8000/preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "items": [
+      {"id": "a", "channel": "main", "anchor": "START", "offset_ms": 0,    "duration_ms": 1000},
+      {"id": "b", "channel": "main", "anchor": "a",     "offset_ms": 0,    "duration_ms": 500},
+      {"id": "e", "channel": "main", "anchor": "b",     "offset_ms": 0,    "duration_ms": 100},
+      {"id": "f", "channel": "main", "anchor": "START", "offset_ms": 1400, "duration_ms": 200},
+      {"id": "c", "channel": "main", "anchor": "START", "offset_ms": 2000, "duration_ms": 500}
+    ],
+    "change": {"id": "b", "duration_ms": 1500}
+  }'
+```
+
+改动前：`b[1000,1500)`、`e[1500,1600)`，冲突对为 `(b,f)`、`(e,f)`。
+将 `b` 的时长改为 `1500` 后：`b[1000,2500)`，锚定 `b` 的 `e` 随动为 `[2500,2600)`；
+`b` 与 `c[2000,2500)` 新产生重叠，`e` 与 `f` 不再重叠。
+
+响应示例（`200`）：
+
+```json
+{
+  "changed_ids": ["b", "e"],
+  "added_conflicts": [
+    {
+      "channel": "main",
+      "a": "b",
+      "b": "c",
+      "a_interval": [1000, 2500],
+      "b_interval": [2000, 2500]
+    }
+  ],
+  "removed_conflicts": [
+    {
+      "channel": "main",
+      "a": "e",
+      "b": "f",
+      "a_interval": [1500, 1600],
+      "b_interval": [1400, 1600]
+    }
+  ]
+}
+```
+
 ## 错误处理
 
 所有业务错误均返回 HTTP `422`，响应体统一为：
@@ -167,6 +242,8 @@ curl -s http://localhost:8000/compile \
 | `MISSING_ANCHOR` | `anchor` 指向一个不存在的口令 id |
 | `DEPENDENCY_CYCLE` | 锚点依赖构成环 |
 | `NEGATIVE_START` | 解析出的口令起点小于 `0`（起点不允许为负） |
+| `INVALID_CHANGE` | `/preview` 的改动未指定口令 id，或 `offset_ms` / `duration_ms` 均未提供新值 |
+| `UNKNOWN_CHANGE_ID` | `/preview` 的改动指定的口令 id 在原编排中不存在 |
 
 ## 本地开发（不使用 Docker）
 
@@ -189,9 +266,9 @@ python3 -m unittest discover -s tests
 .
 ├── app/
 │   ├── __init__.py
-│   ├── compiler.py      # 纯标准库的依赖解析 / 时间计算 / 冲突检测
+│   ├── compiler.py      # 纯标准库的依赖解析 / 时间计算 / 冲突检测 / 改动预演
 │   ├── schemas.py       # Pydantic 请求与响应模型
-│   └── main.py          # FastAPI 入口（/compile、/health、统一错误处理）
+│   └── main.py          # FastAPI 入口（/compile、/preview、/health、统一错误处理）
 ├── tests/
 │   └── test_compiler.py # 核心逻辑单元测试（标准库 unittest）
 ├── requirements.txt
