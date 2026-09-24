@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import copy
 import unittest
 
-from app.compiler import START, CompileError, compile_commands
+from app.compiler import START, CompileError, compile_commands, preview_change
 
 
 def cmd(cid, channel, anchor=START, offset=0, duration=1000):
@@ -230,6 +231,136 @@ class ErrorTests(unittest.TestCase):
                 ]
             )
         self.assertEqual(ctx.exception.code, "DEPENDENCY_CYCLE")
+
+
+class PreviewTests(unittest.TestCase):
+    def sample(self):
+        return [
+            cmd("a", "cam", START, 0, 100),    # [0, 100)
+            cmd("b", "cam", "a", 0, 100),      # [100, 200) 依赖 a，传导
+            cmd("c", "cam", START, 150, 100),  # [150, 250)
+        ]
+
+    def test_offset_shift_changes_target_and_dependents_sorted(self):
+        items = self.sample()
+        result = preview_change(items, {"id": "a", "offset_ms": 50})
+        # a -> [50,150)；b 锚定 a 结束 -> [150,250)；c 不变
+        self.assertEqual(result["changed_ids"], ["a", "b"])
+
+    def test_duration_change_propagates_to_dependents(self):
+        items = self.sample()
+        result = preview_change(items, {"id": "a", "duration_ms": 200})
+        # a -> [0,200)；b -> [200,300)；c 仍为 [150,250)
+        self.assertEqual(result["changed_ids"], ["a", "b"])
+        # a 延长后与 c 新重叠（携带改动后区间）；(b,c) 仍重叠，身份不变
+        self.assertEqual(len(result["added_conflicts"]), 1)
+        pair = result["added_conflicts"][0]
+        self.assertEqual((pair["channel"], pair["a"], pair["b"]), ("cam", "a", "c"))
+        self.assertEqual(pair["a_interval"], [0, 200])
+        self.assertEqual(pair["b_interval"], [150, 250])
+        self.assertEqual(result["removed_conflicts"], [])
+
+    def test_no_change_fields_kept_intact(self):
+        # offset 与 duration 均未变：changed 为空、冲突无增减
+        items = self.sample()
+        result = preview_change(items, {"id": "c", "offset_ms": 150})
+        self.assertEqual(result["changed_ids"], [])
+        self.assertEqual(result["added_conflicts"], [])
+        self.assertEqual(result["removed_conflicts"], [])
+
+    def test_added_conflict_uses_after_interval_and_is_sorted(self):
+        # 原冲突仅 (b,c)；a 右移 60 后新增 (a,b)(a,c)，(b,c) 仍在
+        result = preview_change(self.sample(), {"id": "a", "offset_ms": 60})
+        # a[60,160) b[160,260) c[150,250) -> (a,c) 重叠；a,b 相接不冲突；b,c 重叠
+        added = [(c["channel"], c["a"], c["b"]) for c in result["added_conflicts"]]
+        self.assertEqual(added, [("cam", "a", "c")])
+        pair = result["added_conflicts"][0]
+        self.assertEqual(pair["a_interval"], [60, 160])
+        self.assertEqual(pair["b_interval"], [150, 250])
+        self.assertEqual(result["removed_conflicts"], [])
+
+    def test_removed_conflict_uses_before_interval(self):
+        # 原冲突 (b,c)：c 推迟到 300 后与 b 不再重叠，携带原区间
+        result = preview_change(self.sample(), {"id": "c", "offset_ms": 300})
+        self.assertEqual(len(result["removed_conflicts"]), 1)
+        pair = result["removed_conflicts"][0]
+        self.assertEqual((pair["channel"], pair["a"], pair["b"]), ("cam", "b", "c"))
+        self.assertEqual(pair["a_interval"], [100, 200])
+        self.assertEqual(pair["b_interval"], [150, 250])
+        self.assertEqual(result["added_conflicts"], [])
+        self.assertEqual(result["changed_ids"], ["c"])
+
+    def test_added_and_removed_across_channels_sorted_by_a_b_channel(self):
+        items = [
+            cmd("a", "x", START, 0, 100),
+            cmd("b", "x", START, 50, 100),   # 与 a 冲突
+            cmd("p", "y", START, 0, 100),
+            cmd("q", "y", START, 200, 100),  # 与 p 不冲突
+        ]
+        # a 推迟到 150：(x,a,b) 消失；p 不动... 改 p 的 duration 到 250 使 (y,p,q) 新增
+        result = preview_change(items, {"id": "a", "offset_ms": 150})
+        removed = [
+            (c["a"], c["b"], c["channel"]) for c in result["removed_conflicts"]
+        ]
+        self.assertEqual(removed, [("a", "b", "x")])
+        self.assertEqual(result["removed_conflicts"][0]["b_interval"], [50, 150])
+
+        # 反向：p 延长 -> 新增 (y,p,q)，携带新区间
+        result2 = preview_change(items, {"id": "p", "duration_ms": 250})
+        added = [(c["a"], c["b"], c["channel"]) for c in result2["added_conflicts"]]
+        self.assertEqual(added, [("p", "q", "y")])
+        self.assertEqual(result2["added_conflicts"][0]["a_interval"], [0, 250])
+        self.assertEqual(result2["added_conflicts"][0]["b_interval"], [200, 300])
+
+    def test_does_not_mutate_original_request_data(self):
+        items = self.sample()
+        snapshot = copy.deepcopy(items)
+        preview_change(items, {"id": "a", "offset_ms": 50, "duration_ms": 50})
+        self.assertEqual(items, snapshot)
+
+    def test_does_not_mutate_original_when_fields_omitted(self):
+        # 缺省 anchor / offset_ms 的口令经编译后不应被回写 setdefault
+        minimal = [{"id": "a", "channel": "cam", "duration_ms": 100}]
+        snapshot = copy.deepcopy(minimal)
+        result = preview_change(minimal, {"id": "a", "duration_ms": 200})
+        self.assertEqual(result["changed_ids"], ["a"])
+        self.assertEqual(minimal, snapshot)
+
+    def test_target_id_missing(self):
+        with self.assertRaises(CompileError) as ctx:
+            preview_change(self.sample(), {"id": "ghost", "offset_ms": 1})
+        self.assertEqual(ctx.exception.code, "CHANGE_TARGET_NOT_FOUND")
+        self.assertEqual(ctx.exception.details["id"], "ghost")
+
+    def test_patched_duration_invalid_reuses_validation(self):
+        with self.assertRaises(CompileError) as ctx:
+            preview_change(self.sample(), {"id": "a", "duration_ms": 0})
+        self.assertEqual(ctx.exception.code, "INVALID_DURATION")
+        self.assertEqual(ctx.exception.details["ids"], ["a"])
+
+    def test_patched_negative_start_reuses_validation(self):
+        with self.assertRaises(CompileError) as ctx:
+            preview_change(self.sample(), {"id": "a", "offset_ms": -1})
+        self.assertEqual(ctx.exception.code, "NEGATIVE_START")
+
+    def test_original_errors_surfaced_first(self):
+        with self.assertRaises(CompileError) as ctx:
+            preview_change(
+                [cmd("a", "cam"), cmd("a", "cam")],
+                {"id": "a", "offset_ms": 1},
+            )
+        self.assertEqual(ctx.exception.code, "DUPLICATE_ID")
+
+    def test_change_only_overrides_given_fields(self):
+        items = [
+            cmd("a", "cam", START, 10, 100),  # [10, 110)
+            cmd("b", "cam", "a", 5, 100),     # [115, 215)
+        ]
+        # 只改 offset_ms：duration 保留 100，channel/anchor 保留
+        result = preview_change(items, {"id": "a", "offset_ms": 20})
+        self.assertEqual(result["changed_ids"], ["a", "b"])
+        pair_added = result["added_conflicts"]
+        self.assertEqual(pair_added, [])
 
 
 class LongChainTests(unittest.TestCase):

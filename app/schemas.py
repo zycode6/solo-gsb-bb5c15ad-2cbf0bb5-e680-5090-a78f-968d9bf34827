@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class CommandItem(BaseModel):
@@ -56,6 +56,64 @@ class CompileResponse(BaseModel):
     )
 
 
+class CommandChange(BaseModel):
+    """对一条现有口令的改动：指定 id，并提供 offset_ms / duration_ms 新值。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., description="要改动的现有口令 id（须存在于口令数组中）")
+    offset_ms: int | None = Field(
+        default=None,
+        description="新的相对锚点结束时刻偏移（毫秒），允许为负；不填则保留原值",
+    )
+    duration_ms: int | None = Field(
+        default=None,
+        description="新的持续时长（毫秒），必须为正数；不填则保留原值",
+    )
+
+    @model_validator(mode="after")
+    def require_at_least_one_new_value(self) -> "CommandChange":
+        if self.offset_ms is None and self.duration_ms is None:
+            raise ValueError(
+                "offset_ms 与 duration_ms 至少需要提供一个新值"
+            )
+        return self
+
+
+class PreviewRequest(BaseModel):
+    """POST /preview 请求体：/compile 同格式口令数组 + 一项改动。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    commands: list[CommandItem] = Field(
+        ..., description="口令数组，格式与 POST /compile 的请求体一致"
+    )
+    change: CommandChange = Field(..., description="对现有口令的一项改动")
+
+
+class PreviewResponse(BaseModel):
+    changed_ids: list[str] = Field(
+        ...,
+        description=(
+            "时间起止发生变化的口令 id（含锚点依赖传导），按 id 升序"
+        ),
+    )
+    added_conflicts: list[ConflictPair] = Field(
+        ...,
+        description=(
+            "改动后新增的同通道冲突对，携带改动后版本的区间，"
+            "按 (a, b, channel) 排序"
+        ),
+    )
+    removed_conflicts: list[ConflictPair] = Field(
+        ...,
+        description=(
+            "改动后消失的同通道冲突对，携带原版本的区间，"
+            "按 (a, b, channel) 排序"
+        ),
+    )
+
+
 class ErrorBody(BaseModel):
     code: Literal[
         "INVALID_REQUEST",
@@ -66,6 +124,7 @@ class ErrorBody(BaseModel):
         "MISSING_ANCHOR",
         "DEPENDENCY_CYCLE",
         "NEGATIVE_START",
+        "CHANGE_TARGET_NOT_FOUND",
     ]
     message: str
     details: dict | None = None

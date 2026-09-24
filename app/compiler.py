@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 
 START = "START"
@@ -155,6 +156,84 @@ def compile_commands(items: list[dict[str, Any]]) -> dict[str, Any]:
     conflicts = _find_conflicts(ordered_ids, by_id, starts, ends)
 
     return {"timeline": timeline, "conflicts": conflicts}
+
+
+def preview_change(
+    items: list[dict[str, Any]], change: dict[str, Any]
+) -> dict[str, Any]:
+    """分别编译原编排与改动后的编排，对比时间变化与冲突对增减。
+
+    ``change`` 必须包含现有口令的 ``id``，并提供 ``offset_ms``、
+    ``duration_ms`` 中至少一个新值；未提供的字段保留原值。两次编译均作用于
+    输入的深拷贝，**不会修改 ``items`` / ``change``**，且改动只影响指定字段，
+    不覆盖其他字段。
+
+    :raises CompileError: 原编排或改动后编排非法时抛出去自 ``compile_commands``
+        的原始错误；目标 id 不存在时抛出 ``CHANGE_TARGET_NOT_FOUND``。
+    """
+    # 1) 先编译原编排：沿用全部字段校验与错误格式（深拷贝，避免 setdefault 等改原数据）
+    before = compile_commands(deepcopy(items))
+
+    target = change["id"]
+    if target not in {entry["id"] for entry in before["timeline"]}:
+        raise CompileError(
+            "CHANGE_TARGET_NOT_FOUND",
+            f"改动目标 id 不存在: {target}",
+            {"id": target},
+        )
+
+    # 2) 构造改动后编排：深拷贝后只覆盖显式给出的字段
+    patched = deepcopy(items)
+    for item in patched:
+        if item["id"] == target:
+            if "offset_ms" in change:
+                item["offset_ms"] = change["offset_ms"]
+            if "duration_ms" in change:
+                item["duration_ms"] = change["duration_ms"]
+            break
+
+    # 3) 编译改动后编排（duration_ms 非正、起点为负等校验同样在此触发）
+    after = compile_commands(patched)
+
+    # 4) 时间起止发生变化的口令 id（含锚点依赖传导），按 id 排序
+    before_by_id = {entry["id"]: entry for entry in before["timeline"]}
+    after_by_id = {entry["id"]: entry for entry in after["timeline"]}
+    changed_ids = sorted(
+        cid
+        for cid in before_by_id
+        if (
+            before_by_id[cid]["start_ms"] != after_by_id[cid]["start_ms"]
+            or before_by_id[cid]["end_ms"] != after_by_id[cid]["end_ms"]
+        )
+    )
+
+    # 5) 以 (channel, a, b) 为身份对比冲突对，得到消失与新增集合
+    before_pairs = {
+        (pair["channel"], pair["a"], pair["b"]): pair
+        for pair in before["conflicts"]
+    }
+    after_pairs = {
+        (pair["channel"], pair["a"], pair["b"]): pair
+        for pair in after["conflicts"]
+    }
+    removed_keys = sorted(
+        set(before_pairs) - set(after_pairs), key=_conflict_sort_key
+    )
+    added_keys = sorted(
+        set(after_pairs) - set(before_pairs), key=_conflict_sort_key
+    )
+
+    return {
+        "changed_ids": changed_ids,
+        "added_conflicts": [after_pairs[key] for key in added_keys],
+        "removed_conflicts": [before_pairs[key] for key in removed_keys],
+    }
+
+
+def _conflict_sort_key(pair: tuple[str, str, str]) -> tuple[str, str, str]:
+    """冲突对按 (a, b, channel) 排序。"""
+    channel, a, b = pair
+    return a, b, channel
 
 
 def _resolve_times(
